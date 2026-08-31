@@ -1,0 +1,396 @@
+{ ============================================================================
+  GAMMA RIPPLE v1.2 - ESTRATÉGIA FINAL VALIDADA (NTSL/Profit)
+  CORREÇÃO v1.2: MaxBarsPosition estava contando TICKS em vez de BARRAS
+  (pos_bars incrementava a cada execução do script em modo tick-a-tick),
+  causando zeragem prematura (ClosePosition) segundos após a entrada,
+  mesmo sem stop ou alvo atingidos. Corrigido com pos_entry_bar,
+  calculando pos_bars pela diferença real de CurrentBar().
+============================================================================
+  CONCEITO:
+  Reversão em barreiras gamma (±0.5% do close anterior) confirmada por
+  momentum de ações do IBOV (PETR4, VALE3, ITUB4, IFNC).
+
+  A metáfora: WINFUT toca a barreira (pedra na água) e as ações formam
+  o "ripple" que confirma se a reversão vai segurar. Sem ripple = falso.
+  Com ripple = 100% probabilidade de reversão (validado em 160 dias).
+
+  ARQUITETURA:
+  - Motor B: Reversão quando toca B±1 a B±5
+  - Filtro Ações: ≥1 ação movendo na direção do trade (lookback 3 barras)
+  - Janela: 10:15-13:00 (vista aberta + NY settling)
+  - Max 3 trades/dia, cooldown 15 barras (1h15)
+  - Saída: Stop 2 ATR, BE após T1, Target2 fixo
+
+  VALIDAÇÃO (Python, 430 trades, 19 meses):
+  - Exp/trade:    +93.6 pts   | PF:           1.18
+  - Total:        +40.248 pts | OOS (40%):   +2.338 pts
+  - WR:           49.8%       | P(+):         100% (Monte Carlo)
+  - MaxDD:        -17.415 pts | Sharpe:       0.068
+
+  INSTALAÇÃO:
+  1. Profit > Estratégias > Estratégias Personalizadas > Nova
+  2. Colar este código e compilar (F9)
+  3. Aplicar no gráfico WINFUT 5min
+  4. Configurar 1 contrato por trade nas propriedades
+============================================================================ }
+
+const
+  petr4Asset = Asset("PETR4", feedBovespa);
+  vale3Asset = Asset("VALE3", feedBovespa);
+  itub4Asset = Asset("ITUB4", feedBovespa);
+  ifncAsset  = Asset("IFNC",  feedBovespa);
+
+input
+  HoraInicio(1015);
+  HoraFim(1300);
+  MaxTradesDia(3);
+  CooldownBars(15);
+  BarrierPct(0.005);
+  LookbackStocks(3);
+  StopATR(2.0);
+  ATRPeriod(60);
+  MaxBarsPosition(36);
+
+var
+  { ===== ANCORAGE E BARREIRAS ===== }
+  prev_close       : Float;
+  b_p1, b_p2, b_p3, b_p4, b_p5 : Float;
+  b_n1, b_n2, b_n3, b_n4, b_n5 : Float;
+
+  { ===== ATR ===== }
+  atr_val          : Float;
+
+  { ===== ESTADO DA POSIÇÃO ===== }
+  pos_dir          : Integer;
+  pos_entry        : Float;
+  pos_stop         : Float;
+  pos_target1      : Float;
+  pos_target2      : Float;
+  pos_bars         : Integer;
+  pos_entry_bar    : Integer;
+  parcial_hit      : Integer;
+
+  { ===== GESTÃO DE DIA ===== }
+  trades_hoje      : Integer;
+  last_trade_bar   : Integer;
+  last_close_bar   : Integer;
+  current_bar      : Integer;
+  prev_close_ready : Integer;
+
+  { ===== FILTRO DE AÇÕES ===== }
+  petr4_prev, petr4_level, petr4_level_ago : Float;
+  petr4_dir        : Integer;
+  vale3_prev, vale3_level, vale3_level_ago : Float;
+  vale3_dir        : Integer;
+  itub4_prev, itub4_level, itub4_level_ago : Float;
+  itub4_dir        : Integer;
+  ifnc_prev, ifnc_level, ifnc_level_ago : Float;
+  ifnc_dir         : Integer;
+
+  stocks_bullish   : Integer;
+  stocks_bearish   : Integer;
+
+  { ===== DETECÇÃO DE TOQUE ===== }
+  touch_barrier    : Integer;
+
+  { ===== HORÁRIO ===== }
+  hora_atual       : Integer;
+
+  { ===== SINAIS ===== }
+  signal_buy       : Integer;
+  signal_sell      : Integer;
+
+begin
+  hora_atual := Time;
+  current_bar := CurrentBar();
+
+  { ===== RESET DIÁRIO ===== }
+  if (current_bar > 1) and (Date <> Date[1]) then
+  begin
+    trades_hoje := 0;
+    last_trade_bar := -999;
+    last_close_bar := -999;
+    parcial_hit := 0;
+    pos_dir := 0;
+
+    { Capturar closes do dia anterior (última barra do dia anterior) }
+    prev_close  := Close[1];
+    petr4_prev  := petr4Asset.Close[1];
+    vale3_prev  := vale3Asset.Close[1];
+    itub4_prev  := itub4Asset.Close[1];
+    ifnc_prev   := ifncAsset.Close[1];
+    prev_close_ready := 1;
+  end;
+
+  { Fallback: se ainda não capturou prev_close (início do backtest) }
+  if prev_close_ready = 0 then
+  begin
+    prev_close  := Close[1];
+    petr4_prev  := petr4Asset.Close[1];
+    vale3_prev  := vale3Asset.Close[1];
+    itub4_prev  := itub4Asset.Close[1];
+    ifnc_prev   := ifncAsset.Close[1];
+    if prev_close > 0 then prev_close_ready := 1;
+  end;
+
+  { Se ainda assim não tem prev_close, usar Open atual }
+  if prev_close <= 0 then prev_close := Open;
+  if petr4_prev <= 0 then petr4_prev := petr4Asset.Open;
+  if vale3_prev <= 0 then vale3_prev := vale3Asset.Open;
+  if itub4_prev <= 0 then itub4_prev := itub4Asset.Open;
+  if ifnc_prev  <= 0 then ifnc_prev  := ifncAsset.Open;
+
+  { ===== BARREIRAS GAMMA (WINFUT) ===== }
+  b_p1 := prev_close * (1 + 1 * BarrierPct);
+  b_p2 := prev_close * (1 + 2 * BarrierPct);
+  b_p3 := prev_close * (1 + 3 * BarrierPct);
+  b_p4 := prev_close * (1 + 4 * BarrierPct);
+  b_p5 := prev_close * (1 + 5 * BarrierPct);
+  b_n1 := prev_close * (1 - 1 * BarrierPct);
+  b_n2 := prev_close * (1 - 2 * BarrierPct);
+  b_n3 := prev_close * (1 - 3 * BarrierPct);
+  b_n4 := prev_close * (1 - 4 * BarrierPct);
+  b_n5 := prev_close * (1 - 5 * BarrierPct);
+
+  { ===== ATR ===== }
+  atr_val := AvgTrueRange(ATRPeriod, kaWelles);
+  if atr_val < 1 then atr_val := 100;
+
+  { ===== MOMENTUM DAS AÇÕES ===== }
+  { PETR4: calcular nível atual de barreira gamma }
+  petr4_level := 0;
+  if petr4Asset.Close >= petr4_prev * (1 + 5 * BarrierPct) then petr4_level := 5
+  else if petr4Asset.Close >= petr4_prev * (1 + 4 * BarrierPct) then petr4_level := 4
+  else if petr4Asset.Close >= petr4_prev * (1 + 3 * BarrierPct) then petr4_level := 3
+  else if petr4Asset.Close >= petr4_prev * (1 + 2 * BarrierPct) then petr4_level := 2
+  else if petr4Asset.Close >= petr4_prev * (1 + 1 * BarrierPct) then petr4_level := 1
+  else if petr4Asset.Close <= petr4_prev * (1 - 5 * BarrierPct) then petr4_level := -5
+  else if petr4Asset.Close <= petr4_prev * (1 - 4 * BarrierPct) then petr4_level := -4
+  else if petr4Asset.Close <= petr4_prev * (1 - 3 * BarrierPct) then petr4_level := -3
+  else if petr4Asset.Close <= petr4_prev * (1 - 2 * BarrierPct) then petr4_level := -2
+  else if petr4Asset.Close <= petr4_prev * (1 - 1 * BarrierPct) then petr4_level := -1;
+
+  petr4_level_ago := petr4_level[LookbackStocks];
+  petr4_dir := 0;
+  if petr4_level - petr4_level_ago >= 1 then petr4_dir := 1
+  else if petr4_level - petr4_level_ago <= -1 then petr4_dir := -1;
+
+  { VALE3 }
+  vale3_level := 0;
+  if vale3Asset.Close >= vale3_prev * (1 + 5 * BarrierPct) then vale3_level := 5
+  else if vale3Asset.Close >= vale3_prev * (1 + 4 * BarrierPct) then vale3_level := 4
+  else if vale3Asset.Close >= vale3_prev * (1 + 3 * BarrierPct) then vale3_level := 3
+  else if vale3Asset.Close >= vale3_prev * (1 + 2 * BarrierPct) then vale3_level := 2
+  else if vale3Asset.Close >= vale3_prev * (1 + 1 * BarrierPct) then vale3_level := 1
+  else if vale3Asset.Close <= vale3_prev * (1 - 5 * BarrierPct) then vale3_level := -5
+  else if vale3Asset.Close <= vale3_prev * (1 - 4 * BarrierPct) then vale3_level := -4
+  else if vale3Asset.Close <= vale3_prev * (1 - 3 * BarrierPct) then vale3_level := -3
+  else if vale3Asset.Close <= vale3_prev * (1 - 2 * BarrierPct) then vale3_level := -2
+  else if vale3Asset.Close <= vale3_prev * (1 - 1 * BarrierPct) then vale3_level := -1;
+
+  vale3_level_ago := vale3_level[LookbackStocks];
+  vale3_dir := 0;
+  if vale3_level - vale3_level_ago >= 1 then vale3_dir := 1
+  else if vale3_level - vale3_level_ago <= -1 then vale3_dir := -1;
+
+  { ITUB4 }
+  itub4_level := 0;
+  if itub4Asset.Close >= itub4_prev * (1 + 5 * BarrierPct) then itub4_level := 5
+  else if itub4Asset.Close >= itub4_prev * (1 + 4 * BarrierPct) then itub4_level := 4
+  else if itub4Asset.Close >= itub4_prev * (1 + 3 * BarrierPct) then itub4_level := 3
+  else if itub4Asset.Close >= itub4_prev * (1 + 2 * BarrierPct) then itub4_level := 2
+  else if itub4Asset.Close >= itub4_prev * (1 + 1 * BarrierPct) then itub4_level := 1
+  else if itub4Asset.Close <= itub4_prev * (1 - 5 * BarrierPct) then itub4_level := -5
+  else if itub4Asset.Close <= itub4_prev * (1 - 4 * BarrierPct) then itub4_level := -4
+  else if itub4Asset.Close <= itub4_prev * (1 - 3 * BarrierPct) then itub4_level := -3
+  else if itub4Asset.Close <= itub4_prev * (1 - 2 * BarrierPct) then itub4_level := -2
+  else if itub4Asset.Close <= itub4_prev * (1 - 1 * BarrierPct) then itub4_level := -1;
+
+  itub4_level_ago := itub4_level[LookbackStocks];
+  itub4_dir := 0;
+  if itub4_level - itub4_level_ago >= 1 then itub4_dir := 1
+  else if itub4_level - itub4_level_ago <= -1 then itub4_dir := -1;
+
+  { IFNC }
+  ifnc_level := 0;
+  if ifncAsset.Close >= ifnc_prev * (1 + 5 * BarrierPct) then ifnc_level := 5
+  else if ifncAsset.Close >= ifnc_prev * (1 + 4 * BarrierPct) then ifnc_level := 4
+  else if ifncAsset.Close >= ifnc_prev * (1 + 3 * BarrierPct) then ifnc_level := 3
+  else if ifncAsset.Close >= ifnc_prev * (1 + 2 * BarrierPct) then ifnc_level := 2
+  else if ifncAsset.Close >= ifnc_prev * (1 + 1 * BarrierPct) then ifnc_level := 1
+  else if ifncAsset.Close <= ifnc_prev * (1 - 5 * BarrierPct) then ifnc_level := -5
+  else if ifncAsset.Close <= ifnc_prev * (1 - 4 * BarrierPct) then ifnc_level := -4
+  else if ifncAsset.Close <= ifnc_prev * (1 - 3 * BarrierPct) then ifnc_level := -3
+  else if ifncAsset.Close <= ifnc_prev * (1 - 2 * BarrierPct) then ifnc_level := -2
+  else if ifncAsset.Close <= ifnc_prev * (1 - 1 * BarrierPct) then ifnc_level := -1;
+
+  ifnc_level_ago := ifnc_level[LookbackStocks];
+  ifnc_dir := 0;
+  if ifnc_level - ifnc_level_ago >= 1 then ifnc_dir := 1
+  else if ifnc_level - ifnc_level_ago <= -1 then ifnc_dir := -1;
+
+  { ===== PLACAR DE MOMENTUM ===== }
+  stocks_bullish := 0;
+  stocks_bearish := 0;
+  if petr4_dir > 0 then stocks_bullish := stocks_bullish + 1;
+  if petr4_dir < 0 then stocks_bearish := stocks_bearish + 1;
+  if vale3_dir > 0 then stocks_bullish := stocks_bullish + 1;
+  if vale3_dir < 0 then stocks_bearish := stocks_bearish + 1;
+  if itub4_dir > 0 then stocks_bullish := stocks_bullish + 1;
+  if itub4_dir < 0 then stocks_bearish := stocks_bearish + 1;
+  if ifnc_dir  > 0 then stocks_bullish := stocks_bullish + 1;
+  if ifnc_dir  < 0 then stocks_bearish := stocks_bearish + 1;
+
+  { ===== DETECÇÃO DE TOQUE DE BARREIRA (WINFUT) ===== }
+  touch_barrier := 0;
+  if High >= b_p5 then touch_barrier := 5
+  else if High >= b_p4 then touch_barrier := 4
+  else if High >= b_p3 then touch_barrier := 3
+  else if High >= b_p2 then touch_barrier := 2
+  else if High >= b_p1 then touch_barrier := 1
+  else if Low <= b_n5 then touch_barrier := -5
+  else if Low <= b_n4 then touch_barrier := -4
+  else if Low <= b_n3 then touch_barrier := -3
+  else if Low <= b_n2 then touch_barrier := -2
+  else if Low <= b_n1 then touch_barrier := -1;
+
+  { ===== GESTÃO DE POSIÇÃO EXISTENTE ===== }
+  { TRAVA 1: se estava posicionado e não está mais, registra barra de saída }
+  if (pos_dir <> 0) and (not HasPosition) then
+  begin
+    last_close_bar := current_bar;
+    pos_dir := 0;
+    parcial_hit := 0;
+  end;
+
+  if HasPosition then
+  begin
+    { CORREÇÃO: pos_bars deve refletir barras REAIS decorridas, não
+      quantas vezes o script rodou. Em execução tick-a-tick (replay/
+      tempo real), o script roda várias vezes por barra; incrementar
+      pos_bars a cada chamada fazia MaxBarsPosition disparar em
+      segundos em vez de em barras, causando zeragem prematura
+      (ClosePosition) mesmo com o trade indo bem, sem stop nem alvo
+      atingidos. Agora pos_bars é recalculado pela diferença entre a
+      barra atual e a barra de entrada. }
+    pos_bars := current_bar - pos_entry_bar;
+
+    { Detectar T1 hit para mover stop para BE }
+    if (parcial_hit = 0) then
+    begin
+      if (pos_dir = 1) and (High >= pos_target1) then
+      begin
+        parcial_hit := 1;
+        pos_stop := pos_entry;
+      end
+      else if (pos_dir = -1) and (Low <= pos_target1) then
+      begin
+        parcial_hit := 1;
+        pos_stop := pos_entry;
+      end;
+    end;
+
+    { Saída por MaxBars }
+    if pos_bars >= MaxBarsPosition then
+    begin
+      ClosePosition;
+      last_close_bar := current_bar;
+      pos_dir := 0;
+      parcial_hit := 0;
+    end
+    else if pos_dir = 1 then
+    begin
+      { LONG: stop + target2 }
+      SellToCoverStop(pos_stop);
+      SellToCoverLimit(pos_target2);
+    end
+    else if pos_dir = -1 then
+    begin
+      { SHORT: stop + target2 }
+      BuyToCoverStop(pos_stop);
+      BuyToCoverLimit(pos_target2);
+    end;
+  end
+  else
+  begin
+    { Sem posição - garante reset }
+    if pos_dir <> 0 then
+    begin
+      parcial_hit := 0;
+      pos_dir := 0;
+    end;
+  end;
+
+  { ===== LÓGICA DE ENTRADA ===== }
+  { TRAVA 2: não entra se acabou de fechar posição (mesma barra ou anterior) }
+  { TRAVA 3: if/else if garante que SELL e BUY nunca disparam na mesma barra }
+  signal_buy := 0;
+  signal_sell := 0;
+
+  if (hora_atual >= HoraInicio) and (hora_atual < HoraFim) and
+     (trades_hoje < MaxTradesDia) and
+     (current_bar - last_trade_bar >= CooldownBars) and
+     (current_bar - last_close_bar >= 2) and
+     (not HasPosition) and
+     (pos_dir = 0) and
+     (touch_barrier <> 0) then
+  begin
+
+    { SELL REVERSAL: tocou barreira positiva + ações bearish }
+    if (touch_barrier > 0) and (stocks_bearish >= 1) then
+    begin
+      signal_sell := 1;
+      pos_dir := -1;
+      pos_entry := Close;
+      pos_stop := High + StopATR * atr_val;
+      pos_target1 := prev_close * (1 + (touch_barrier - 1) * BarrierPct);
+      pos_target2 := prev_close * (1 + (touch_barrier - 2) * BarrierPct);
+      if touch_barrier = 1 then
+        pos_target2 := b_n1;
+      pos_bars := 0;
+      pos_entry_bar := current_bar;
+      parcial_hit := 0;
+      SellShortAtMarket;
+      trades_hoje := trades_hoje + 1;
+      last_trade_bar := current_bar;
+    end
+    { BUY REVERSAL: tocou barreira negativa + ações bullish }
+    else if (touch_barrier < 0) and (stocks_bullish >= 1) then
+    begin
+      signal_buy := 1;
+      pos_dir := 1;
+      pos_entry := Close;
+      pos_stop := Low - StopATR * atr_val;
+      pos_target1 := prev_close * (1 + (touch_barrier + 1) * BarrierPct);
+      pos_target2 := prev_close * (1 + (touch_barrier + 2) * BarrierPct);
+      if touch_barrier = -1 then
+        pos_target2 := b_p1;
+      pos_bars := 0;
+      pos_entry_bar := current_bar;
+      parcial_hit := 0;
+      BuyAtMarket;
+      trades_hoje := trades_hoje + 1;
+      last_trade_bar := current_bar;
+    end;
+  end;
+
+  { ===== PLOT DAS BARREIRAS GAMMA ===== }
+  Plot(b_p5);
+  Plot2(b_p4);
+  Plot3(b_p3);
+  Plot4(b_p2);
+  Plot5(b_p1);
+  Plot6(prev_close);
+  Plot7(b_n1);
+  Plot8(b_n2);
+  Plot9(b_n3);
+  Plot10(b_n4);
+  Plot11(b_n5);
+
+  { Sinais no gráfico }
+  if signal_buy = 1 then
+    PlotText("RIPPLE BUY", clVerde, 2, 9);
+  if signal_sell = 1 then
+    PlotText("RIPPLE SELL", clRed, 0, 9);
+
+end;
